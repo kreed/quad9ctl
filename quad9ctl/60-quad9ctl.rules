@@ -1,0 +1,9 @@
+// Let administrators in an active local session toggle Quad9 DNS routing
+// from the quick-settings extension without a password prompt.  Non-wheel
+// users fall through to the auth_admin defaults in the .policy file, so a
+// compromised unprivileged session cannot silently disable DNS filtering.
+polkit.addRule(function (action, subject) {
+    if (action.id === "io.github.kreed.quad9ctl" &&
+        subject.local && subject.active && subject.isInGroup("wheel"))
+        return polkit.Result.YES;
+});

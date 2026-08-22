@@ -1,0 +1,10 @@
+#!/bin/bash
+# Re-apply the Quad9 per-network bypass rules as connections come and go.
+# quad9ctl recomputes the desired state from all active connections, so this
+# only needs to know that the set changed, not how.
+
+case "$2" in
+    up|down|vpn-up|vpn-down)
+        exec /usr/bin/quad9ctl apply
+        ;;
+esac

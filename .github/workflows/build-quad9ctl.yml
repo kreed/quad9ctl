@@ -1,0 +1,77 @@
+---
+name: Build quad9ctl RPM
+
+on:
+  pull_request:
+    paths:
+      - "quad9ctl/**"
+  push:
+    branches:
+      - main
+    paths:
+      - "quad9ctl/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-quad9ctl-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scratch-build:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    container: fedora:44
+    env:
+      CLONE_URL: ${{ github.event.pull_request.head.repo.clone_url }}
+      COMMIT: ${{ github.event.pull_request.head.sha }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+
+    steps:
+      - name: Install COPR client
+        run: dnf -y --setopt=install_weak_deps=False install copr-cli
+
+      - name: Configure COPR
+        env:
+          COPR_CONFIG: ${{ secrets.COPR_CONFIG }}
+        run: |
+          test -n "${COPR_CONFIG}"
+          install -d --mode=0700 "${HOME}/.config"
+          printf '%s\n' "${COPR_CONFIG}" > "${HOME}/.config/copr"
+          chmod 0600 "${HOME}/.config/copr"
+
+      - name: Build in COPR pull-request repository
+        run: |
+          copr-cli buildscm "quad9ctl:pr:${PR_NUMBER}" \
+            --clone-url "${CLONE_URL}" \
+            --commit "${COMMIT}" \
+            --subdir quad9ctl \
+            --spec quad9ctl.spec \
+            --type git \
+            --method rpkg
+
+  # The spec derives its version from git via rpkg, so every push produces a
+  # unique NVR and the canonical build can run unconditionally.
+  final-build:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    container: fedora:44
+
+    steps:
+      - name: Install COPR client
+        run: dnf -y --setopt=install_weak_deps=False install copr-cli
+
+      - name: Configure COPR
+        env:
+          COPR_CONFIG: ${{ secrets.COPR_CONFIG }}
+        run: |
+          test -n "${COPR_CONFIG}"
+          install -d --mode=0700 "${HOME}/.config"
+          printf '%s\n' "${COPR_CONFIG}" > "${HOME}/.config/copr"
+          chmod 0600 "${HOME}/.config/copr"
+
+      - name: Publish canonical COPR build
+        run: copr-cli build-package quad9ctl --name quad9ctl

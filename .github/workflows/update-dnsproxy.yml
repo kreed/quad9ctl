@@ -1,0 +1,84 @@
+---
+name: Update dnsproxy
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: update-dnsproxy
+  cancel-in-progress: true
+
+jobs:
+  update:
+    runs-on: ubuntu-24.04
+    container: fedora:44
+
+    steps:
+      - name: Install packaging tools
+        run: >-
+          dnf -y --setopt=install_weak_deps=False install
+          curl gh git go-vendor-tools golang tar xz
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Trust the container workspace
+        run: git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+
+      - name: Find latest release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(gh api repos/AdguardTeam/dnsproxy/releases/latest --jq '.tag_name | ltrimstr("v")')"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Update package sources
+        id: update
+        run: |
+          dnsproxy/update.sh "${{ steps.release.outputs.version }}"
+          if git diff --quiet; then
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
+          else
+            echo "changed=true" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Open or update pull request
+        if: ${{ steps.update.outputs.changed == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          branch="automation/update-dnsproxy"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "${branch}"
+          git add dnsproxy
+          git commit -m "chore: update dnsproxy to ${VERSION}"
+          # This fixed branch is owned exclusively by this workflow.
+          git push --force origin "${branch}"
+
+          pr_number="$(gh pr list --head "${branch}" --state open --json number --jq '.[0].number // empty')"
+          if [[ -z "${pr_number}" ]]; then
+            gh pr create \
+              --base main \
+              --head "${branch}" \
+              --title "chore: update dnsproxy to ${VERSION}" \
+              --body "Updates dnsproxy to ${VERSION} and regenerates its vendored Go sources with Fedora go-vendor-tools. COPR performs the source and binary RPM validation."
+            pr_number="$(gh pr list --head "${branch}" --state open --json number --jq '.[0].number')"
+          fi
+
+          gh workflow run build-dnsproxy.yml \
+            --ref main \
+            --field clone-url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" \
+            --field commit="$(git rev-parse HEAD)" \
+            --field pr-number="${pr_number}"

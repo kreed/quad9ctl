@@ -1,0 +1,611 @@
+#!/usr/bin/python3
+"""Manage the Quad9 DNS-over-QUIC resolver, its per-network bypass rules and
+per-domain ECS carve-outs."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from contextlib import contextmanager
+from pathlib import Path
+
+# The runtime bypass works by masking the shipped resolved drop-in, so the two
+# must share a filename.  It names the feature, not this tool.
+DROPIN_NAME = "60-quad9-doq.conf"
+RUNTIME_DROPIN_DIR = Path("/run/systemd/resolved.conf.d")
+RUNTIME_DROPIN = RUNTIME_DROPIN_DIR / DROPIN_NAME
+
+# Bypass intent is split from the routing switch above: the manual marker
+# records a 'quad9ctl disable', and the network marker records which active
+# connections matched a bypass rule on the last reconcile.  Both live on tmpfs
+# so a reboot returns routing to Quad9 until the dispatcher re-applies rules.
+STATE_DIR = Path("/run/quad9ctl")
+MANUAL_MARKER = STATE_DIR / "manual-bypass"
+NETWORK_MARKER = STATE_DIR / "network-bypass"
+LOCK_FILE = STATE_DIR / "lock"
+
+# Per-network bypass rules, one "<uuid> <connection name>" per line.  The UUID
+# identifies the NetworkManager connection profile; the name is display-only.
+NETWORKS_FILE = Path("/etc/dnsproxy/networks")
+
+# quad9-dnsproxy.service reads this with a leading '-', so its absence just leaves the
+# variable empty and contributes no upstream argument at all.  Nothing is
+# shipped: the file exists only while at least one carve-out does.
+ENV_FILE = Path("/etc/dnsproxy/ecs.env")
+ENV_VAR = "ECS_UPSTREAMS"
+ECS_UPSTREAM = "quic://dns11.quad9.net:853"
+
+UPSTREAM_RE = re.compile(r"--upstream=\[/(?P<domain>[^/\]]+)/\]")
+_LABEL = r"(?!-)[A-Za-z0-9-]{1,63}(?<!-)"
+DOMAIN_RE = re.compile(rf"^{_LABEL}(\.{_LABEL})+$")
+
+
+def die(message: str, code: int = 1) -> None:
+    print(message, file=sys.stderr)
+    raise SystemExit(code)
+
+
+def require_root(action: str) -> None:
+    if os.geteuid() != 0:
+        die(f"quad9ctl {action} must be run as root (for example: sudo quad9ctl {action})")
+
+
+def systemctl(*args: str) -> int:
+    return subprocess.run(["systemctl", *args], capture_output=True, text=True).returncode
+
+
+def unit_active(unit: str) -> bool:
+    return systemctl("is-active", "--quiet", unit) == 0
+
+
+def normalise(domain: str) -> str:
+    return domain.strip().rstrip(".").lower()
+
+
+@contextmanager
+def state_lock():
+    """Serialise mutating commands across the dispatcher and pkexec callers.
+
+    reconcile() is a multi-step read-decide-act sequence; two concurrent
+    callers (a dispatcher 'apply' racing a quick-settings toggle) could
+    otherwise interleave into routing that matches neither intent.
+    """
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(LOCK_FILE, "w") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+
+
+# --- NetworkManager connections ---------------------------------------------
+
+# Connection types that do not represent a network the user joins: always-on
+# virtual profiles such as libvirt bridges would otherwise show up as bypass
+# candidates and, being permanently active, turn a rule into a standing bypass.
+VIRTUAL_TYPES = {"loopback", "bridge", "dummy", "tun", "tap", "veth", "generic", "wifi-p2p"}
+
+
+def nm_connections(active_only: bool) -> list[tuple[str, str]]:
+    """Return (uuid, name) pairs, excluding virtual connection types.
+
+    NAME is requested last because it is the only field that can contain
+    colons, which nmcli's terse mode escapes with a backslash.  Raises
+    RuntimeError when NetworkManager cannot be queried.
+    """
+    command = ["nmcli", "-t", "-f", "UUID,TYPE,NAME", "connection", "show"]
+    if active_only:
+        command.append("--active")
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"nmcli failed: {result.stderr.strip() or 'unknown error'}")
+
+    connections = []
+    for line in result.stdout.splitlines():
+        parts = line.split(":", 2)
+        if len(parts) != 3 or parts[1] in VIRTUAL_TYPES:
+            continue
+        uuid, _type, name = parts
+        connections.append((uuid, name.replace("\\:", ":").replace("\\\\", "\\")))
+    return connections
+
+
+def try_nm_connections(active_only: bool) -> list[tuple[str, str]]:
+    """nm_connections, degraded to an empty list when NetworkManager is down.
+
+    Routing decisions and status must not hard-fail during a NetworkManager
+    restart window; a manual bypass still applies and network rules simply
+    cannot match until the next dispatcher event.
+    """
+    try:
+        return nm_connections(active_only)
+    except RuntimeError as error:
+        print(f"warning: {error}", file=sys.stderr)
+        return []
+
+
+# --- Per-network bypass rules ------------------------------------------------
+
+
+def load_rules() -> dict[str, str]:
+    if not NETWORKS_FILE.exists():
+        return {}
+    rules: dict[str, str] = {}
+    for line in NETWORKS_FILE.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        uuid, _, name = line.partition(" ")
+        rules[uuid] = name
+    return rules
+
+
+def write_rules(rules: dict[str, str]) -> None:
+    """Rewrite the rules file, or remove it when no rules remain.
+
+    Replacement is atomic for the same reason as the ECS environment file.
+    """
+    if not rules:
+        NETWORKS_FILE.unlink(missing_ok=True)
+        try:
+            NETWORKS_FILE.parent.rmdir()
+        except OSError:
+            pass  # still holds other files, or was never created
+        return
+
+    body = "# Managed by quad9ctl; change it with 'quad9ctl network add|remove'.\n"
+    body += "".join(f"{uuid} {name}\n" for uuid, name in sorted(rules.items()))
+
+    NETWORKS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        "w", dir=NETWORKS_FILE.parent, prefix=".networks.", delete=False
+    ) as handle:
+        handle.write(body)
+        tmp = Path(handle.name)
+    tmp.chmod(0o644)
+    tmp.replace(NETWORKS_FILE)
+
+
+def matched_networks() -> list[str]:
+    rules = load_rules()
+    return [name for uuid, name in try_nm_connections(active_only=True) if uuid in rules]
+
+
+# --- Routing reconciliation ---------------------------------------------------
+
+
+def is_bypassed() -> bool:
+    return RUNTIME_DROPIN.is_symlink() and os.readlink(RUNTIME_DROPIN) == "/dev/null"
+
+
+def apply_bypass() -> None:
+    RUNTIME_DROPIN_DIR.mkdir(parents=True, exist_ok=True)
+    RUNTIME_DROPIN.unlink(missing_ok=True)
+    RUNTIME_DROPIN.symlink_to("/dev/null")
+    if systemctl("reload", "systemd-resolved.service") != 0:
+        die(
+            "systemd-resolved failed to reload; DNS may still use Quad9. "
+            "Retry 'quad9ctl apply'. The staged bypass applies if "
+            "systemd-resolved restarts before the next reboot."
+        )
+
+    # Reload the resolver before stopping the proxy so there is no interval in
+    # which queries are still routed to a dead local listener.  Stopping the
+    # proxy also cancels requests that were pending when the bypass was applied.
+    if systemctl("stop", "quad9-dnsproxy.service") != 0 or unit_active("quad9-dnsproxy.service"):
+        die(
+            "DNS routing is bypassed until the next reboot, but dnsproxy failed "
+            "to stop and may continue requests that were already pending."
+        )
+    subprocess.run(["resolvectl", "flush-caches"], capture_output=True)
+
+
+def apply_quad9() -> None:
+    # 'restart' rather than 'start': a proxy that survived the bypass, or was
+    # started by hand, may still hold pre-edit upstream arguments.
+    systemctl("restart", "quad9-dnsproxy.service")
+    if not unit_active("quad9-dnsproxy.service"):
+        die("dnsproxy failed to start; leaving the current DNS routing unchanged")
+    RUNTIME_DROPIN.unlink(missing_ok=True)
+    systemctl("reload", "systemd-resolved.service")
+    subprocess.run(["resolvectl", "flush-caches"], capture_output=True)
+
+
+def reconcile(quiet: bool = False) -> None:
+    """Bring routing in line with the manual marker and per-network rules.
+
+    Root-only.  Idempotent, so the NetworkManager dispatcher can call it on
+    every connection change.
+    """
+    manual = MANUAL_MARKER.exists()
+    matched = matched_networks()
+    desired_bypass = manual or bool(matched)
+
+    if desired_bypass and not is_bypassed():
+        apply_bypass()
+        if not quiet:
+            reasons = ["manual"] * manual + [f"network rule: {n}" for n in matched]
+            print(f"Quad9 DNS over QUIC bypassed ({', '.join(reasons)}).")
+    elif not desired_bypass and is_bypassed():
+        apply_quad9()
+        if not quiet:
+            print("Quad9 DNS over QUIC enabled.")
+    elif not desired_bypass:
+        # Already routed to Quad9; make sure the proxy is actually serving.
+        systemctl("start", "quad9-dnsproxy.service")
+        if not unit_active("quad9-dnsproxy.service"):
+            die(
+                "dnsproxy is not running while public DNS is routed to it; "
+                "check 'systemctl status quad9-dnsproxy.service'"
+            )
+
+    # Recorded only after the transition above succeeded, so status never
+    # reports a bypass that was not actually applied.
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    if matched:
+        staged = NETWORK_MARKER.with_name(NETWORK_MARKER.name + ".tmp")
+        staged.write_text("".join(f"{name}\n" for name in matched))
+        staged.replace(NETWORK_MARKER)
+    else:
+        NETWORK_MARKER.unlink(missing_ok=True)
+
+
+def restart_proxy() -> None:
+    # Upstreams are command-line arguments, so a reload would not pick up
+    # edits.  While bypassed the proxy is intentionally stopped, so new
+    # arguments are simply picked up on its next start.
+    if is_bypassed():
+        return
+    systemctl("restart", "quad9-dnsproxy.service")
+    if not unit_active("quad9-dnsproxy.service"):
+        die("dnsproxy failed to restart; check 'systemctl status quad9-dnsproxy.service'")
+    subprocess.run(["resolvectl", "flush-caches"], capture_output=True)
+
+
+# --- ECS carve-outs -----------------------------------------------------------
+
+
+def carveout_domains() -> list[str]:
+    if not ENV_FILE.exists():
+        return []
+    domains: list[str] = []
+    for line in ENV_FILE.read_text().splitlines():
+        line = line.strip()
+        if not line.startswith(f"{ENV_VAR}="):
+            continue
+        domains += [normalise(m.group("domain")) for m in UPSTREAM_RE.finditer(line)]
+    return domains
+
+
+def write_carveouts(domains: list[str]) -> None:
+    """Rewrite the environment file, or remove it when nothing is carved out.
+
+    Replacement is atomic so a failure cannot leave dnsproxy reading a partial
+    line on its next restart.
+    """
+    if not domains:
+        ENV_FILE.unlink(missing_ok=True)
+        try:
+            ENV_FILE.parent.rmdir()
+        except OSError:
+            pass  # still holds other files, or was never created
+        return
+
+    arguments = " ".join(f"--upstream=[/{d}/]{ECS_UPSTREAM}" for d in domains)
+    body = (
+        "# Managed by quad9ctl; change it with 'quad9ctl ecs add|remove'.\n"
+        f"{ENV_VAR}={arguments}\n"
+    )
+
+    ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        "w", dir=ENV_FILE.parent, prefix=".ecs.env.", delete=False
+    ) as handle:
+        handle.write(body)
+        tmp = Path(handle.name)
+    tmp.chmod(0o644)
+    tmp.replace(ENV_FILE)
+
+
+# --- Commands -----------------------------------------------------------------
+
+
+def cmd_enable(_: argparse.Namespace) -> None:
+    require_root("enable")
+    with state_lock():
+        was_manual = MANUAL_MARKER.exists()
+        MANUAL_MARKER.unlink(missing_ok=True)
+        try:
+            reconcile(quiet=True)
+        except SystemExit:
+            # Routing did not switch; restore the recorded intent to match.
+            if was_manual:
+                MANUAL_MARKER.touch()
+            raise
+    matched = matched_networks()
+    if matched:
+        print(f"Manual bypass cleared; still bypassed by network rule: {', '.join(matched)}.")
+    else:
+        print("Quad9 DNS over QUIC enabled.")
+
+
+def cmd_disable(_: argparse.Namespace) -> None:
+    require_root("disable")
+    with state_lock():
+        MANUAL_MARKER.touch()
+        reconcile(quiet=True)
+    print("Quad9 DNS over QUIC bypassed until re-enabled or the next reboot.")
+
+
+def cmd_apply(_: argparse.Namespace) -> None:
+    require_root("apply")
+    with state_lock():
+        reconcile()
+
+
+def bypass_reasons() -> list[str]:
+    reasons = []
+    if MANUAL_MARKER.exists():
+        reasons.append("manual")
+    if NETWORK_MARKER.exists():
+        names = NETWORK_MARKER.read_text().splitlines()
+        reasons += [f"network rule: {name}" for name in names]
+    return reasons
+
+
+def cmd_status(args: argparse.Namespace) -> None:
+    rules = load_rules()
+
+    if args.json:
+        active = try_nm_connections(active_only=True)
+        print(
+            json.dumps(
+                {
+                    "routing": "bypassed" if is_bypassed() else "quad9",
+                    "manual_bypass": MANUAL_MARKER.exists(),
+                    "network_bypass": (
+                        NETWORK_MARKER.read_text().splitlines()
+                        if NETWORK_MARKER.exists()
+                        else []
+                    ),
+                    "proxy_active": unit_active("quad9-dnsproxy.service"),
+                    "resolver_active": unit_active("systemd-resolved.service"),
+                    "ecs_domains": carveout_domains(),
+                    "network_rules": [
+                        {"uuid": uuid, "name": name} for uuid, name in sorted(rules.items())
+                    ],
+                    "active_connections": [
+                        {"uuid": uuid, "name": name, "bypass": uuid in rules}
+                        for uuid, name in active
+                    ],
+                }
+            )
+        )
+        return
+
+    if is_bypassed():
+        reasons = bypass_reasons()
+        detail = f" ({', '.join(reasons)})" if reasons else ""
+        print(f"Routing:  bypassed{detail} (using NetworkManager-provided DNS)")
+    else:
+        print("Routing:  enabled (public DNS routed to Quad9 over DoQ)")
+
+    print(f"Proxy:    {'active' if unit_active('quad9-dnsproxy.service') else 'inactive'}")
+    print(f"Resolver: {'active' if unit_active('systemd-resolved.service') else 'inactive'}")
+
+    domains = carveout_domains()
+    if domains:
+        print(f"ECS:      on for {len(domains)} domain(s): {' '.join(domains)}")
+    else:
+        print("ECS:      off for all domains")
+
+    if rules:
+        print(f"Networks: bypass on {len(rules)} network(s): {' '.join(sorted(rules.values()))}")
+    else:
+        print("Networks: no per-network bypass rules")
+
+
+# --- network subcommands ------------------------------------------------------
+
+
+def resolve_connection(spec: str | None) -> tuple[str, str]:
+    """Resolve a name or UUID to a saved connection, defaulting to the active one.
+
+    Unlike routing decisions, rule editing genuinely needs NetworkManager, so
+    an nmcli failure is fatal here.
+    """
+    try:
+        if spec is None:
+            active = nm_connections(active_only=True)
+            if len(active) == 1:
+                return active[0]
+            if not active:
+                die("No active connection; name the network to add explicitly.")
+            names = ", ".join(name for _uuid, name in active)
+            die(f"Several connections are active ({names}); name one explicitly.")
+
+        saved = nm_connections(active_only=False)
+    except RuntimeError as error:
+        die(str(error))
+    matches = [c for c in saved if spec in (c[0], c[1])]
+    if not matches:
+        die(f"No NetworkManager connection named {spec!r}.")
+    if len(matches) > 1:
+        die(f"{spec!r} is ambiguous; use one of the UUIDs: {' '.join(u for u, _ in matches)}")
+    return matches[0]
+
+
+def cmd_network_list(_: argparse.Namespace) -> None:
+    rules = load_rules()
+    if not rules:
+        print("No per-network bypass rules; every network resolves through Quad9.")
+        return
+    try:
+        saved = {uuid for uuid, _name in nm_connections(active_only=False)}
+    except RuntimeError:
+        saved = None  # cannot check staleness without NetworkManager
+    print("Networks whose own resolver is used instead of Quad9:")
+    for uuid, name in sorted(rules.items(), key=lambda r: r[1]):
+        stale = "  (connection no longer exists)" if saved is not None and uuid not in saved else ""
+        print(f"  {name}  [{uuid}]{stale}")
+
+
+def cmd_network_add(args: argparse.Namespace) -> None:
+    require_root("network add")
+    uuid, name = resolve_connection(args.connection)
+
+    with state_lock():
+        rules = load_rules()
+        if uuid in rules:
+            print(f"{name} already has a bypass rule.")
+            return
+
+        rules[uuid] = name
+        write_rules(rules)
+        reconcile(quiet=True)
+    print(f"{name} now uses its own resolver instead of Quad9.")
+
+
+def cmd_network_remove(args: argparse.Namespace) -> None:
+    require_root("network remove")
+    with state_lock():
+        rules = load_rules()
+        matches = [u for u, n in rules.items() if args.connection in (u, n)]
+        if not matches:
+            die(f"No bypass rule for {args.connection!r}.")
+        if len(matches) > 1:
+            die(f"{args.connection!r} is ambiguous; use one of the UUIDs: {' '.join(matches)}")
+
+        name = rules.pop(matches[0])
+        write_rules(rules)
+        reconcile(quiet=True)
+    print(f"{name} returned to Quad9 DNS over QUIC.")
+
+
+# --- ecs subcommands ----------------------------------------------------------
+
+
+def cmd_ecs_list(_: argparse.Namespace) -> None:
+    domains = carveout_domains()
+    if not domains:
+        print("No ECS carve-outs configured; every domain uses the ECS-stripped upstream.")
+        return
+    print("Domains resolved through Quad9's ECS-enabled service:")
+    for domain in domains:
+        print(f"  {domain}")
+
+
+def cmd_ecs_add(args: argparse.Namespace) -> None:
+    require_root("ecs add")
+    domain = normalise(args.domain)
+    if not DOMAIN_RE.match(domain):
+        die(f"Not a valid domain name: {args.domain}", 2)
+
+    with state_lock():
+        domains = carveout_domains()
+        if domain in domains:
+            print(f"{domain} already has an ECS carve-out.")
+            return
+
+        write_carveouts(domains + [domain])
+        restart_proxy()
+    print(f"{domain} now resolves through Quad9's ECS-enabled service.")
+
+
+def cmd_ecs_remove(args: argparse.Namespace) -> None:
+    require_root("ecs remove")
+    domain = normalise(args.domain)
+
+    with state_lock():
+        domains = carveout_domains()
+        if domain not in domains:
+            die(f"No ECS carve-out for {domain}.")
+
+        write_carveouts([d for d in domains if d != domain])
+        restart_proxy()
+    print(f"{domain} returned to the ECS-stripped upstream.")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="quad9ctl",
+        description=(
+            "Manage the Quad9 DNS-over-QUIC resolver, its per-network bypass "
+            "rules and ECS carve-outs."
+        ),
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("enable", help="clear the manual bypass and re-apply routing").set_defaults(
+        func=cmd_enable
+    )
+    sub.add_parser("disable", help="bypass the proxy until the next reboot").set_defaults(
+        func=cmd_disable
+    )
+    sub.add_parser(
+        "apply",
+        help="reconcile routing with the bypass rules (used by the NetworkManager dispatcher)",
+    ).set_defaults(func=cmd_apply)
+
+    status = sub.add_parser("status", help="show routing, proxy, ECS and network state")
+    status.add_argument("--json", action="store_true", help="machine-readable output")
+    status.set_defaults(func=cmd_status)
+
+    network = sub.add_parser(
+        "network",
+        help="manage per-network bypass rules",
+        description=(
+            "Bypass Quad9 on selected networks so their own resolver, such as "
+            "a caching router, handles public DNS while connected."
+        ),
+    )
+    network_sub = network.add_subparsers(dest="network_command", required=True)
+
+    network_sub.add_parser("list", help="list networks with bypass rules").set_defaults(
+        func=cmd_network_list
+    )
+
+    add = network_sub.add_parser(
+        "add", help="bypass Quad9 while connected to a network (default: the active one)"
+    )
+    add.add_argument("connection", nargs="?", help="connection name or UUID")
+    add.set_defaults(func=cmd_network_add)
+
+    remove = network_sub.add_parser("remove", help="return a network to Quad9")
+    remove.add_argument("connection", help="connection name or UUID")
+    remove.set_defaults(func=cmd_network_remove)
+
+    ecs = sub.add_parser(
+        "ecs",
+        help="manage per-domain EDNS Client Subnet carve-outs",
+        description=(
+            "Send individual domains to Quad9's ECS-enabled service so that "
+            "latency-routed records resolve to a nearby endpoint."
+        ),
+    )
+    ecs_sub = ecs.add_subparsers(dest="ecs_command", required=True)
+
+    ecs_sub.add_parser("list", help="list carved-out domains").set_defaults(func=cmd_ecs_list)
+
+    add = ecs_sub.add_parser("add", help="route a domain through the ECS-enabled service")
+    add.add_argument("domain")
+    add.set_defaults(func=cmd_ecs_add)
+
+    remove = ecs_sub.add_parser("remove", help="return a domain to the ECS-stripped default")
+    remove.add_argument("domain")
+    remove.set_defaults(func=cmd_ecs_remove)
+
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

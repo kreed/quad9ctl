@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1.0/policyconfig.dtd">
+<policyconfig>
+  <!-- Lets the quick-settings toggle run quad9ctl through pkexec.  The
+       shipped rules.d file makes this promptless for administrators (wheel)
+       in an active local session; everyone else authenticates as admin, with
+       the grant kept briefly so menu interactions don't prompt repeatedly.
+       quad9ctl accepts no file paths or shell input, so this does not grant
+       broader root access. -->
+  <action id="io.github.kreed.quad9ctl">
+    <description>Manage Quad9 DNS routing</description>
+    <message>Authentication is required to change DNS routing</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/quad9ctl</annotate>
+  </action>
+</policyconfig>
