@@ -1,12 +1,13 @@
 // Quick-settings front-end for quad9ctl.
 //
-// The toggle mirrors the manual enable/disable state: its fill tracks only
-// whether a manual bypass is set, while transient conditions (bypassed by a
-// network rule, proxy inactive) surface in the subtitle. The menu holds just
-// the per-network bypass switch and a Settings entry; everything else lives
-// in the preferences window (prefs.js). All state changes go through
-// quad9ctl via pkexec; a shipped polkit rule makes that promptless for
-// administrators in an active local session.
+// The tile is an indicator, not a switch: its fill shows whether Quad9 is
+// actually resolving right now, the subtitle names the reason when it is not
+// (e.g. bypassed on the connected network), and pressing it does nothing.
+// When Quad9 is disabled outright the tile disappears; re-enable from the
+// settings window or the CLI. The menu holds just the per-network bypass
+// switch and a Settings entry. All state changes go through quad9ctl via
+// pkexec; a shipped polkit rule makes that promptless for administrators in
+// an active local session.
 
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
@@ -63,8 +64,6 @@ class Quad9Toggle extends QuickMenuToggle {
         });
         this.menu.addMenuItem(settingsItem);
 
-        this.connect('clicked',
-            () => this._runCtl([this.checked ? 'disable' : 'enable']));
         this.menu.connect('open-state-changed',
             (_menu, open) => open && this._refresh());
 
@@ -129,13 +128,14 @@ class Quad9Toggle extends QuickMenuToggle {
     }
 
     _update(status) {
-        this.checked = !status.manual_bypass;
+        this.visible = !status.disabled;
+        this.checked = status.routing === 'quad9';
 
         let subtitle;
-        if (status.manual_bypass)
-            subtitle = 'Bypassed until reboot';
-        else if (status.network_bypass.length > 0)
-            subtitle = `Bypassed on ${status.network_bypass.join(', ')}`;
+        if (status.routing === 'bypassed')
+            subtitle = status.network_bypass.length > 0
+                ? `Bypassed on ${status.network_bypass.join(', ')}`
+                : 'Bypassed';
         else if (status.proxy_active)
             subtitle = 'Active';
         else

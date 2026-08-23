@@ -19,7 +19,7 @@ Requires:       polkit
 %description
 quad9ctl routes public DNS through a local dnsproxy instance speaking strict
 DNS over QUIC to Quad9, while systemd-resolved keeps network-specific domains
-on their per-link resolvers. It manages a temporary manual bypass, standing
+on their per-link resolvers. It manages a persistent off switch, standing
 per-network bypass rules applied by a NetworkManager dispatcher, and
 per-domain EDNS Client Subnet exceptions.
 
@@ -29,9 +29,10 @@ Requires:       %{name} = %{version}-%{release}
 Requires:       gnome-shell
 
 %description -n gnome-shell-extension-quad9
-A GNOME Shell quick-settings toggle fronting quad9ctl: enable or bypass Quad9
-DNS over QUIC and switch the bypass for the connected network, with a settings
-window for network bypass rules, ECS exceptions and routing status.
+A GNOME Shell quick-settings indicator fronting quad9ctl: it shows whether
+Quad9 DNS over QUIC is resolving and why not when bypassed, switches the
+bypass for the connected network, and opens a settings window for the master
+switch, network bypass rules, ECS exceptions and routing status.
 
 %prep
 {{{ git_dir_setup_macro }}}

@@ -57,20 +57,23 @@ class SettingsPage {
 
         this.page = new Adw.PreferencesPage({title: 'Quad9 DNS'});
 
-        // --- Status ---------------------------------------------------
-        const status = new Adw.PreferencesGroup({title: 'Status'});
-        status.set_header_suffix(
-            actionButton('view-refresh-symbolic', 'Refresh', () => this.refresh()));
-
+        // --- Master switch ----------------------------------------------
+        const master = new Adw.PreferencesGroup();
         this._routeSwitch = new Adw.SwitchRow({
-            title: 'Route public DNS through Quad9',
-            subtitle: 'Turning this off bypasses Quad9 until re-enabled or the next reboot',
+            title: 'Quad9 DNS',
+            subtitle: 'Route public DNS through Quad9’s threat-blocking resolver ' +
+                'over DNS over QUIC',
         });
         this._routeSwitch.connect('notify::active', () => {
             if (!this._updating)
                 this._act([this._routeSwitch.active ? 'enable' : 'disable']);
         });
-        status.add(this._routeSwitch);
+        master.add(this._routeSwitch);
+
+        // --- Status ---------------------------------------------------
+        const status = new Adw.PreferencesGroup({title: 'Status'});
+        status.set_header_suffix(
+            actionButton('view-refresh-symbolic', 'Refresh', () => this.refresh()));
 
         this._routingRow = valueRow('Routing');
         this._proxyRow = valueRow('Proxy');
@@ -120,6 +123,7 @@ class SettingsPage {
         });
         this._ecs.add(this._ecsEntry);
 
+        this.page.add(master);
         this.page.add(status);
         this.page.add(this._networks);
         this.page.add(this._ecs);
@@ -152,13 +156,17 @@ class SettingsPage {
         }
 
         this._updating = true;
-        this._routeSwitch.active = !status.manual_bypass;
+        this._routeSwitch.active = !status.disabled;
         this._updating = false;
 
-        if (status.routing !== 'bypassed')
+        // Everything below the master switch is inert while disabled.
+        this._networks.sensitive = !status.disabled;
+        this._ecs.sensitive = !status.disabled;
+
+        if (status.routing === 'disabled')
+            this._routingRow._value.label = 'Disabled';
+        else if (status.routing !== 'bypassed')
             this._routingRow._value.label = 'Quad9 over DoQ';
-        else if (status.manual_bypass)
-            this._routingRow._value.label = 'Bypassed manually';
         else if (status.network_bypass.length > 0)
             this._routingRow._value.label = `Bypassed on ${status.network_bypass.join(', ')}`;
         else

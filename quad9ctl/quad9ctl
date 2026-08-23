@@ -15,19 +15,25 @@ import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 
-# The runtime bypass works by masking the shipped resolved drop-in, so the two
-# must share a filename.  It names the feature, not this tool.
+# Bypasses work by masking the shipped resolved drop-in, so the masks must
+# share its filename.  It names the feature, not this tool.
+#
+# The transient per-network bypass masks in /run, cleared at reboot and
+# re-applied by the NetworkManager dispatcher.  'quad9ctl disable' masks in
+# /etc instead (and masks the proxy unit), so it persists until re-enabled:
+# the /etc symlink itself is the disabled state.
 DROPIN_NAME = "60-quad9-doq.conf"
 RUNTIME_DROPIN_DIR = Path("/run/systemd/resolved.conf.d")
 RUNTIME_DROPIN = RUNTIME_DROPIN_DIR / DROPIN_NAME
+ETC_DROPIN_DIR = Path("/etc/systemd/resolved.conf.d")
+ETC_DROPIN = ETC_DROPIN_DIR / DROPIN_NAME
 
-# Bypass intent is split from the routing switch above: the manual marker
-# records a 'quad9ctl disable', and the network marker records which active
-# connections matched a bypass rule on the last reconcile.  Both live on tmpfs
-# so a reboot returns routing to Quad9 until the dispatcher re-applies rules.
+# The network marker records which active connections matched a bypass rule on
+# the last reconcile; the state stamp changes on every reconcile so the shell
+# extension's directory monitor always sees state transitions.
 STATE_DIR = Path("/run/quad9ctl")
-MANUAL_MARKER = STATE_DIR / "manual-bypass"
 NETWORK_MARKER = STATE_DIR / "network-bypass"
+STATE_STAMP = STATE_DIR / "state"
 LOCK_FILE = STATE_DIR / "lock"
 
 # Per-network bypass rules, one "<uuid> <connection name>" per line.  The UUID
@@ -118,7 +124,7 @@ def try_nm_connections(active_only: bool) -> list[tuple[str, str]]:
     """nm_connections, degraded to an empty list when NetworkManager is down.
 
     Routing decisions and status must not hard-fail during a NetworkManager
-    restart window; a manual bypass still applies and network rules simply
+    restart window; the disabled state still applies and network rules simply
     cannot match until the next dispatcher event.
     """
     try:
@@ -182,6 +188,18 @@ def is_bypassed() -> bool:
     return RUNTIME_DROPIN.is_symlink() and os.readlink(RUNTIME_DROPIN) == "/dev/null"
 
 
+def is_disabled() -> bool:
+    return ETC_DROPIN.is_symlink() and os.readlink(ETC_DROPIN) == "/dev/null"
+
+
+def routing_state() -> str:
+    if is_disabled():
+        return "disabled"
+    if is_bypassed():
+        return "bypassed"
+    return "quad9"
+
+
 def apply_bypass() -> None:
     RUNTIME_DROPIN_DIR.mkdir(parents=True, exist_ok=True)
     RUNTIME_DROPIN.unlink(missing_ok=True)
@@ -215,29 +233,42 @@ def apply_quad9() -> None:
     subprocess.run(["resolvectl", "flush-caches"], capture_output=True)
 
 
+def write_stamp() -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_STAMP.write_text(f"{routing_state()}\n")
+
+
 def reconcile(quiet: bool = False) -> None:
-    """Bring routing in line with the manual marker and per-network rules.
+    """Bring routing in line with the disabled state and per-network rules.
 
     Root-only.  Idempotent, so the NetworkManager dispatcher can call it on
     every connection change.
     """
-    manual = MANUAL_MARKER.exists()
-    matched = matched_networks()
-    desired_bypass = manual or bool(matched)
+    if is_disabled():
+        # Fully off: the persistent /etc mask and the masked proxy unit carry
+        # the state across reboots; tidy any transient bypass leftovers.
+        RUNTIME_DROPIN.unlink(missing_ok=True)
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        NETWORK_MARKER.unlink(missing_ok=True)
+        write_stamp()
+        return
 
-    if desired_bypass and not is_bypassed():
+    matched = matched_networks()
+
+    if matched and not is_bypassed():
         apply_bypass()
         if not quiet:
-            reasons = ["manual"] * manual + [f"network rule: {n}" for n in matched]
-            print(f"Quad9 DNS over QUIC bypassed ({', '.join(reasons)}).")
-    elif not desired_bypass and is_bypassed():
+            reasons = ", ".join(f"network rule: {n}" for n in matched)
+            print(f"Quad9 DNS over QUIC bypassed ({reasons}).")
+    elif not matched and is_bypassed():
         apply_quad9()
         if not quiet:
             print("Quad9 DNS over QUIC enabled.")
-    elif not desired_bypass:
+    elif not matched:
         # Already routed to Quad9; make sure the proxy is actually serving.
         systemctl("start", "quad9-dnsproxy.service")
         if not unit_active("quad9-dnsproxy.service"):
+            write_stamp()
             die(
                 "dnsproxy is not running while public DNS is routed to it; "
                 "check 'systemctl status quad9-dnsproxy.service'"
@@ -252,13 +283,14 @@ def reconcile(quiet: bool = False) -> None:
         staged.replace(NETWORK_MARKER)
     else:
         NETWORK_MARKER.unlink(missing_ok=True)
+    write_stamp()
 
 
 def restart_proxy() -> None:
     # Upstreams are command-line arguments, so a reload would not pick up
-    # edits.  While bypassed the proxy is intentionally stopped, so new
-    # arguments are simply picked up on its next start.
-    if is_bypassed():
+    # edits.  While bypassed or disabled the proxy is intentionally down, so
+    # new arguments are simply picked up on its next start.
+    if is_disabled() or is_bypassed():
         return
     systemctl("restart", "quad9-dnsproxy.service")
     if not unit_active("quad9-dnsproxy.service"):
@@ -317,18 +349,19 @@ def write_ecs_exceptions(domains: list[str]) -> None:
 def cmd_enable(_: argparse.Namespace) -> None:
     require_root("enable")
     with state_lock():
-        was_manual = MANUAL_MARKER.exists()
-        MANUAL_MARKER.unlink(missing_ok=True)
-        try:
-            reconcile(quiet=True)
-        except SystemExit:
-            # Routing did not switch; restore the recorded intent to match.
-            if was_manual:
-                MANUAL_MARKER.touch()
-            raise
+        # Bring the proxy up before removing the mask so a start failure
+        # leaves Quad9 cleanly disabled rather than routed to a dead listener.
+        systemctl("unmask", "quad9-dnsproxy.service")
+        systemctl("start", "quad9-dnsproxy.service")
+        if not unit_active("quad9-dnsproxy.service"):
+            die("dnsproxy failed to start; Quad9 DNS remains disabled")
+        ETC_DROPIN.unlink(missing_ok=True)
+        if systemctl("reload", "systemd-resolved.service") != 0:
+            die("systemd-resolved failed to reload; retry 'quad9ctl enable'.")
+        reconcile(quiet=True)
     matched = matched_networks()
     if matched:
-        print(f"Manual bypass cleared; still bypassed by network rule: {', '.join(matched)}.")
+        print(f"Quad9 enabled, but currently bypassed by network rule: {', '.join(matched)}.")
     else:
         print("Quad9 DNS over QUIC enabled.")
 
@@ -336,9 +369,25 @@ def cmd_enable(_: argparse.Namespace) -> None:
 def cmd_disable(_: argparse.Namespace) -> None:
     require_root("disable")
     with state_lock():
-        MANUAL_MARKER.touch()
+        ETC_DROPIN_DIR.mkdir(parents=True, exist_ok=True)
+        ETC_DROPIN.unlink(missing_ok=True)
+        ETC_DROPIN.symlink_to("/dev/null")
+        if systemctl("reload", "systemd-resolved.service") != 0:
+            die(
+                "systemd-resolved failed to reload; DNS may still use Quad9. "
+                "Retry 'quad9ctl disable'. The staged mask applies when "
+                "systemd-resolved next restarts."
+            )
+        # Mask the unit as well so the resolved drop-in's Wants= cannot pull
+        # the proxy back up at boot while disabled.
+        systemctl("mask", "--now", "quad9-dnsproxy.service")
+        if unit_active("quad9-dnsproxy.service"):
+            die(
+                "DNS routing is disabled, but dnsproxy failed to stop and may "
+                "continue requests that were already pending."
+            )
         reconcile(quiet=True)
-    print("Quad9 DNS over QUIC bypassed until re-enabled or the next reboot.")
+    print("Quad9 DNS over QUIC disabled until re-enabled.")
 
 
 def cmd_apply(_: argparse.Namespace) -> None:
@@ -348,13 +397,10 @@ def cmd_apply(_: argparse.Namespace) -> None:
 
 
 def bypass_reasons() -> list[str]:
-    reasons = []
-    if MANUAL_MARKER.exists():
-        reasons.append("manual")
-    if NETWORK_MARKER.exists():
-        names = NETWORK_MARKER.read_text().splitlines()
-        reasons += [f"network rule: {name}" for name in names]
-    return reasons
+    if not NETWORK_MARKER.exists():
+        return []
+    names = NETWORK_MARKER.read_text().splitlines()
+    return [f"network rule: {name}" for name in names]
 
 
 def cmd_status(args: argparse.Namespace) -> None:
@@ -369,8 +415,8 @@ def cmd_status(args: argparse.Namespace) -> None:
         print(
             json.dumps(
                 {
-                    "routing": "bypassed" if is_bypassed() else "quad9",
-                    "manual_bypass": MANUAL_MARKER.exists(),
+                    "routing": routing_state(),
+                    "disabled": is_disabled(),
                     "network_bypass": (
                         NETWORK_MARKER.read_text().splitlines()
                         if NETWORK_MARKER.exists()
@@ -396,7 +442,9 @@ def cmd_status(args: argparse.Namespace) -> None:
         )
         return
 
-    if is_bypassed():
+    if is_disabled():
+        print("Routing:  disabled (Quad9 off until re-enabled)")
+    elif is_bypassed():
         reasons = bypass_reasons()
         detail = f" ({', '.join(reasons)})" if reasons else ""
         print(f"Routing:  bypassed{detail} (using NetworkManager-provided DNS)")
@@ -549,12 +597,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("enable", help="clear the manual bypass and re-apply routing").set_defaults(
+    sub.add_parser("enable", help="turn Quad9 routing on and re-apply network rules").set_defaults(
         func=cmd_enable
     )
-    sub.add_parser("disable", help="bypass the proxy until the next reboot").set_defaults(
-        func=cmd_disable
-    )
+    sub.add_parser(
+        "disable", help="turn Quad9 off until re-enabled (persists across reboots)"
+    ).set_defaults(func=cmd_disable)
     sub.add_parser(
         "apply",
         help="reconcile routing with the bypass rules (used by the NetworkManager dispatcher)",

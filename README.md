@@ -11,7 +11,7 @@ The pieces, all installed by the `quad9ctl` RPM:
   bounded 4 MiB cache and coalesced duplicate queries.
 - **resolved drop-ins** point systemd-resolved's global scope at the proxy
   (`DNS=127.0.0.1:53`, `Domains=~.`) and pull the proxy in via `Wants=`.
-- **quad9ctl** manages routing: a temporary manual bypass, standing
+- **quad9ctl** manages routing: a persistent off switch, standing
   per-network bypass rules, and per-domain ECS exceptions.
 - **A NetworkManager dispatcher** re-applies the rules as connections come
   and go.
@@ -31,11 +31,12 @@ sudo systemctl restart systemd-resolved                  # picks up the drop-ins
 On bootc/ostree images, install both packages at image build time; the
 routing takes effect on first boot with no scriptlet requirements.
 
-## Manual bypass
+## Disabling
 
-The temporary bypass returns public DNS to the active network's resolver and
-stops the proxy, cancelling any requests still pending there. It is cleared
-automatically at reboot:
+`quad9ctl disable` turns Quad9 off entirely until re-enabled — including
+across reboots: it masks the resolved drop-in in `/etc` and masks the proxy
+unit so nothing starts at boot. Transient situations are better served by a
+network bypass or an ECS exception.
 
 ```bash
 quad9ctl status
@@ -65,17 +66,18 @@ and are stored in `/etc/dnsproxy/networks`. Note the usual caveat: an access
 point imitating a saved network activates the same profile, so a rule is a
 statement of trust in the network, not an authentication of it.
 
-A manual `quad9ctl disable` always wins over the rules; `quad9ctl enable`
-clears only the manual bypass, so on a listed network routing stays bypassed
-and the status says why.
+Disabling Quad9 always wins over the rules; re-enabling returns routing to
+rule-driven behaviour, so on a listed network it comes back bypassed and the
+status says why.
 
 ## Quick settings
 
-The Quad9 DNS quick-settings toggle in GNOME Shell fronts the same tool.
-Pressing it is `quad9ctl enable`/`disable`; its fill tracks the manual state
-only, while the subtitle surfaces transient conditions such as "Bypassed on
-Home". The menu toggles the bypass rule for the connected network and opens
-the settings window, which mirrors everything the CLI exposes: routing,
+The Quad9 DNS quick-settings tile in GNOME Shell is an indicator: its fill
+shows whether Quad9 is resolving right now, the subtitle names the reason
+when it is not (such as "Bypassed on Home"), and the tile disappears
+entirely while Quad9 is disabled. Its menu toggles the bypass rule for the
+connected network and opens the settings window, which mirrors everything
+the CLI exposes: a master switch that gates the other settings, routing,
 proxy and resolver status, the network bypass list, and ECS exceptions. A
 polkit rule (`io.github.kreed.quad9ctl`) lets administrators (wheel members)
 in an active local session run quad9ctl through pkexec without a password
