@@ -12,7 +12,7 @@ The pieces, all installed by the `quad9ctl` RPM:
 - **resolved drop-ins** point systemd-resolved's global scope at the proxy
   (`DNS=127.0.0.1:53`, `Domains=~.`) and pull the proxy in via `Wants=`.
 - **quad9ctl** manages routing: a temporary manual bypass, standing
-  per-network bypass rules, and per-domain ECS carve-outs.
+  per-network bypass rules, and per-domain ECS exceptions.
 - **A NetworkManager dispatcher** re-applies the rules as connections come
   and go.
 - **gnome-shell-extension-quad9** (separate RPM) adds a quick-settings toggle
@@ -73,11 +73,12 @@ and the status says why.
 The Quad9 DNS quick-settings toggle in GNOME Shell fronts the same tool.
 Pressing it is `quad9ctl enable`/`disable`; its fill tracks the manual state
 only, while the subtitle surfaces transient conditions such as "Bypassed on
-Home". The menu toggles the bypass rule for the connected network and manages
-ECS carve-outs. A polkit rule (`io.github.kreed.quad9ctl`) lets
-administrators (wheel members) in an active local session run quad9ctl
-through pkexec without a password prompt; everyone else authenticates as
-admin.
+Home". The menu toggles the bypass rule for the connected network and opens
+the settings window, which mirrors everything the CLI exposes: routing,
+proxy and resolver status, the network bypass list, and ECS exceptions. A
+polkit rule (`io.github.kreed.quad9ctl`) lets administrators (wheel members)
+in an active local session run quad9ctl through pkexec without a password
+prompt; everyone else authenticates as admin.
 
 The extension ships disabled; turn it on with:
 
@@ -88,7 +89,7 @@ gnome-extensions enable quad9@kreed.github.io
 or enable it for all users through a gschema override for
 `org.gnome.shell enabled-extensions`.
 
-## ECS carve-outs
+## ECS exceptions
 
 Queries go to Quad9's ECS-stripped service by default, so no part of your
 address reaches authoritative servers. The trade-off is that DNS-based geo
@@ -105,14 +106,14 @@ sudo quad9ctl ecs add example.com
 sudo quad9ctl ecs remove example.com
 ```
 
-Nothing is carved out by default, and nothing is shipped to configure it:
-`quad9ctl` writes `/etc/dnsproxy/ecs.env` when the first carve-out is added
-and removes it again with the last. The service reads that path optionally,
-so its absence simply contributes no upstream argument.
+There are no exceptions by default, and nothing is shipped to configure
+them: `quad9ctl` writes `/etc/dnsproxy/ecs.env` when the first exception is
+added and removes it again with the last. The service reads that path
+optionally, so its absence simply contributes no upstream argument.
 
 They only help where the authoritative honours ECS from any resolver. Akamai
 restricts it to an allowlist of resolver operators, and Cloudflare and Fastly
-are anycast and ignore it, so carve-outs for domains they front do nothing.
+are anycast and ignore it, so exceptions for domains they front do nothing.
 Confirm one is worth keeping by comparing a few rounds of:
 
 ```bash

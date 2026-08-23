@@ -2,25 +2,23 @@
 //
 // The toggle mirrors the manual enable/disable state: its fill tracks only
 // whether a manual bypass is set, while transient conditions (bypassed by a
-// network rule, proxy inactive) surface in the subtitle.  All state changes go
-// through quad9ctl via pkexec; a shipped polkit rule makes that promptless for
-// active local sessions.
+// network rule, proxy inactive) surface in the subtitle. The menu holds just
+// the per-network bypass switch and a Settings entry; everything else lives
+// in the preferences window (prefs.js). All state changes go through
+// quad9ctl via pkexec; a shipped polkit rule makes that promptless for
+// administrators in an active local session.
 
-import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
-import St from 'gi://St';
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
-import * as ModalDialog from 'resource:///org/gnome/shell/ui/modalDialog.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import {QuickMenuToggle, SystemIndicator} from 'resource:///org/gnome/shell/ui/quickSettings.js';
 
 const QUAD9CTL = '/usr/bin/quad9ctl';
 const STATE_DIR = '/run/quad9ctl';
-const ICON = 'security-high-symbolic';
 
 function run(argv) {
     return new Promise((resolve, reject) => {
@@ -40,54 +38,30 @@ function run(argv) {
     });
 }
 
-const DomainDialog = GObject.registerClass(
-class DomainDialog extends ModalDialog.ModalDialog {
-    _init(onAdd) {
-        super._init();
-
-        const content = new St.BoxLayout({
-            orientation: Clutter.Orientation.VERTICAL,
-            style: 'spacing: 12px; min-width: 22em;',
-        });
-        content.add_child(new St.Label({
-            text: 'Route a domain through Quad9’s ECS-enabled service:',
-        }));
-        this._entry = new St.Entry({hint_text: 'example.com', can_focus: true});
-        content.add_child(this._entry);
-        this.contentLayout.add_child(content);
-
-        const add = () => {
-            const domain = this._entry.get_text().trim();
-            this.close();
-            if (domain)
-                onAdd(domain);
-        };
-        this._entry.clutter_text.connect('activate', add);
-
-        this.setButtons([
-            {label: 'Cancel', action: () => this.close(), key: Clutter.KEY_Escape},
-            {label: 'Add', action: add, default: true},
-        ]);
-        this.setInitialKeyFocus(this._entry);
-    }
-});
-
 const Quad9Toggle = GObject.registerClass(
 class Quad9Toggle extends QuickMenuToggle {
-    _init() {
+    _init(extension) {
+        const gicon = Gio.icon_new_for_string(
+            `${extension.path}/icons/quad9-symbolic.svg`);
+
         super._init({
             title: 'Quad9 DNS',
-            iconName: ICON,
+            gicon,
             toggleMode: false,
         });
 
-        this.menu.setHeader(ICON, 'Quad9 DNS');
+        this.menu.setHeader(gicon, 'Quad9 DNS');
 
         this._networkSection = new PopupMenu.PopupMenuSection();
         this.menu.addMenuItem(this._networkSection);
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
-        this._ecsMenu = new PopupMenu.PopupSubMenuMenuItem('ECS carve-outs', false);
-        this.menu.addMenuItem(this._ecsMenu);
+
+        const settingsItem = new PopupMenu.PopupMenuItem('Settings…');
+        settingsItem.connect('activate', () => {
+            Main.panel.closeQuickSettings();
+            extension.openPreferences();
+        });
+        this.menu.addMenuItem(settingsItem);
 
         this.connect('clicked',
             () => this._runCtl([this.checked ? 'disable' : 'enable']));
@@ -167,7 +141,7 @@ class Quad9Toggle extends QuickMenuToggle {
         else
             subtitle = 'Proxy inactive';
         this.subtitle = subtitle;
-        this.menu.setHeader(ICON, 'Quad9 DNS', subtitle);
+        this.menu.setHeader(this.gicon, 'Quad9 DNS', subtitle);
 
         this._networkSection.removeAll();
         if (status.active_connections.length === 0) {
@@ -181,40 +155,20 @@ class Quad9Toggle extends QuickMenuToggle {
                 this._runCtl(['network', state ? 'add' : 'remove', conn.uuid]));
             this._networkSection.addMenuItem(item);
         }
-
-        this._ecsMenu.label.text = status.ecs_domains.length > 0
-            ? `ECS carve-outs (${status.ecs_domains.length})`
-            : 'ECS carve-outs';
-        this._ecsMenu.menu.removeAll();
-        for (const domain of status.ecs_domains) {
-            const item = new PopupMenu.PopupMenuItem(domain);
-            item.add_child(new St.Icon({
-                icon_name: 'edit-delete-symbolic',
-                style_class: 'popup-menu-icon',
-            }));
-            item.connect('activate', () => this._runCtl(['ecs', 'remove', domain]));
-            this._ecsMenu.menu.addMenuItem(item);
-        }
-        const addItem = new PopupMenu.PopupMenuItem('Add domain…');
-        addItem.connect('activate', () => {
-            Main.panel.closeQuickSettings();
-            new DomainDialog(domain => this._runCtl(['ecs', 'add', domain])).open();
-        });
-        this._ecsMenu.menu.addMenuItem(addItem);
     }
 });
 
 const Quad9Indicator = GObject.registerClass(
 class Quad9Indicator extends SystemIndicator {
-    _init() {
+    _init(extension) {
         super._init();
-        this.quickSettingsItems.push(new Quad9Toggle());
+        this.quickSettingsItems.push(new Quad9Toggle(extension));
     }
 });
 
 export default class Quad9Extension extends Extension {
     enable() {
-        this._indicator = new Quad9Indicator();
+        this._indicator = new Quad9Indicator(this);
         Main.panel.statusArea.quickSettings.addExternalIndicator(this._indicator);
     }
 

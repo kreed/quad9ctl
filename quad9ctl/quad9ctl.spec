@@ -21,7 +21,7 @@ quad9ctl routes public DNS through a local dnsproxy instance speaking strict
 DNS over QUIC to Quad9, while systemd-resolved keeps network-specific domains
 on their per-link resolvers. It manages a temporary manual bypass, standing
 per-network bypass rules applied by a NetworkManager dispatcher, and
-per-domain EDNS Client Subnet carve-outs.
+per-domain EDNS Client Subnet exceptions.
 
 %package -n gnome-shell-extension-quad9
 Summary:        GNOME quick-settings toggle for Quad9 DNS routing
@@ -30,7 +30,8 @@ Requires:       gnome-shell
 
 %description -n gnome-shell-extension-quad9
 A GNOME Shell quick-settings toggle fronting quad9ctl: enable or bypass Quad9
-DNS over QUIC, and manage per-network bypass rules and ECS carve-outs.
+DNS over QUIC and switch the bypass for the connected network, with a settings
+window for network bypass rules, ECS exceptions and routing status.
 
 %prep
 {{{ git_dir_setup_macro }}}
@@ -50,10 +51,8 @@ install -D --mode=0644 io.github.kreed.quad9ctl.policy \
     %{buildroot}%{_datadir}/polkit-1/actions/io.github.kreed.quad9ctl.policy
 install -D --mode=0644 60-quad9ctl.rules \
     %{buildroot}%{_datadir}/polkit-1/rules.d/60-quad9ctl.rules
-install -D --mode=0644 quad9@kreed.github.io/metadata.json \
-    %{buildroot}%{_datadir}/gnome-shell/extensions/quad9@kreed.github.io/metadata.json
-install -D --mode=0644 quad9@kreed.github.io/extension.js \
-    %{buildroot}%{_datadir}/gnome-shell/extensions/quad9@kreed.github.io/extension.js
+install -d %{buildroot}%{_datadir}/gnome-shell/extensions
+cp -r quad9@kreed.github.io %{buildroot}%{_datadir}/gnome-shell/extensions/
 
 # quad9ctl creates these on first use and removes them when emptied; ghosting
 # them keeps 'rpm -qf' and erasure bookkeeping accurate.

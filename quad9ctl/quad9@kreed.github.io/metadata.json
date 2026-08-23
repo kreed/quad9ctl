@@ -1,7 +1,7 @@
 {
   "uuid": "quad9@kreed.github.io",
   "name": "Quad9 DNS",
-  "description": "Quick-settings control for the Quad9 DNS-over-QUIC proxy: toggle the manual bypass, manage per-network bypass rules and ECS carve-outs via quad9ctl.",
+  "description": "Quick-settings control for the Quad9 DNS-over-QUIC proxy: toggle the manual bypass, switch per-network bypass rules, and manage everything else from its settings window — all via quad9ctl.",
   "url": "https://github.com/kreed/quad9ctl",
   "shell-version": ["48", "49", "50"]
 }

@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 """Manage the Quad9 DNS-over-QUIC resolver, its per-network bypass rules and
-per-domain ECS carve-outs."""
+per-domain ECS exceptions."""
 
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ NETWORKS_FILE = Path("/etc/dnsproxy/networks")
 
 # quad9-dnsproxy.service reads this with a leading '-', so its absence just leaves the
 # variable empty and contributes no upstream argument at all.  Nothing is
-# shipped: the file exists only while at least one carve-out does.
+# shipped: the file exists only while at least one exception does.
 ENV_FILE = Path("/etc/dnsproxy/ecs.env")
 ENV_VAR = "ECS_UPSTREAMS"
 ECS_UPSTREAM = "quic://dns11.quad9.net:853"
@@ -266,10 +266,10 @@ def restart_proxy() -> None:
     subprocess.run(["resolvectl", "flush-caches"], capture_output=True)
 
 
-# --- ECS carve-outs -----------------------------------------------------------
+# --- ECS exceptions -----------------------------------------------------------
 
 
-def carveout_domains() -> list[str]:
+def ecs_exceptions() -> list[str]:
     if not ENV_FILE.exists():
         return []
     domains: list[str] = []
@@ -281,8 +281,8 @@ def carveout_domains() -> list[str]:
     return domains
 
 
-def write_carveouts(domains: list[str]) -> None:
-    """Rewrite the environment file, or remove it when nothing is carved out.
+def write_ecs_exceptions(domains: list[str]) -> None:
+    """Rewrite the environment file, or remove it when no exceptions remain.
 
     Replacement is atomic so a failure cannot leave dnsproxy reading a partial
     line on its next restart.
@@ -362,6 +362,10 @@ def cmd_status(args: argparse.Namespace) -> None:
 
     if args.json:
         active = try_nm_connections(active_only=True)
+        try:
+            saved = {uuid for uuid, _name in nm_connections(active_only=False)}
+        except RuntimeError:
+            saved = None  # cannot check rule staleness without NetworkManager
         print(
             json.dumps(
                 {
@@ -374,9 +378,14 @@ def cmd_status(args: argparse.Namespace) -> None:
                     ),
                     "proxy_active": unit_active("quad9-dnsproxy.service"),
                     "resolver_active": unit_active("systemd-resolved.service"),
-                    "ecs_domains": carveout_domains(),
+                    "ecs_domains": ecs_exceptions(),
                     "network_rules": [
-                        {"uuid": uuid, "name": name} for uuid, name in sorted(rules.items())
+                        {
+                            "uuid": uuid,
+                            "name": name,
+                            "saved": None if saved is None else uuid in saved,
+                        }
+                        for uuid, name in sorted(rules.items())
                     ],
                     "active_connections": [
                         {"uuid": uuid, "name": name, "bypass": uuid in rules}
@@ -397,7 +406,7 @@ def cmd_status(args: argparse.Namespace) -> None:
     print(f"Proxy:    {'active' if unit_active('quad9-dnsproxy.service') else 'inactive'}")
     print(f"Resolver: {'active' if unit_active('systemd-resolved.service') else 'inactive'}")
 
-    domains = carveout_domains()
+    domains = ecs_exceptions()
     if domains:
         print(f"ECS:      on for {len(domains)} domain(s): {' '.join(domains)}")
     else:
@@ -490,9 +499,9 @@ def cmd_network_remove(args: argparse.Namespace) -> None:
 
 
 def cmd_ecs_list(_: argparse.Namespace) -> None:
-    domains = carveout_domains()
+    domains = ecs_exceptions()
     if not domains:
-        print("No ECS carve-outs configured; every domain uses the ECS-stripped upstream.")
+        print("No ECS exceptions configured; every domain uses the ECS-stripped upstream.")
         return
     print("Domains resolved through Quad9's ECS-enabled service:")
     for domain in domains:
@@ -506,12 +515,12 @@ def cmd_ecs_add(args: argparse.Namespace) -> None:
         die(f"Not a valid domain name: {args.domain}", 2)
 
     with state_lock():
-        domains = carveout_domains()
+        domains = ecs_exceptions()
         if domain in domains:
-            print(f"{domain} already has an ECS carve-out.")
+            print(f"{domain} already has an ECS exception.")
             return
 
-        write_carveouts(domains + [domain])
+        write_ecs_exceptions(domains + [domain])
         restart_proxy()
     print(f"{domain} now resolves through Quad9's ECS-enabled service.")
 
@@ -521,11 +530,11 @@ def cmd_ecs_remove(args: argparse.Namespace) -> None:
     domain = normalise(args.domain)
 
     with state_lock():
-        domains = carveout_domains()
+        domains = ecs_exceptions()
         if domain not in domains:
-            die(f"No ECS carve-out for {domain}.")
+            die(f"No ECS exception for {domain}.")
 
-        write_carveouts([d for d in domains if d != domain])
+        write_ecs_exceptions([d for d in domains if d != domain])
         restart_proxy()
     print(f"{domain} returned to the ECS-stripped upstream.")
 
@@ -535,7 +544,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="quad9ctl",
         description=(
             "Manage the Quad9 DNS-over-QUIC resolver, its per-network bypass "
-            "rules and ECS carve-outs."
+            "rules and ECS exceptions."
         ),
     )
     sub = parser.add_subparsers(dest="command", required=True)
@@ -581,7 +590,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     ecs = sub.add_parser(
         "ecs",
-        help="manage per-domain EDNS Client Subnet carve-outs",
+        help="manage per-domain EDNS Client Subnet exceptions",
         description=(
             "Send individual domains to Quad9's ECS-enabled service so that "
             "latency-routed records resolve to a nearby endpoint."
@@ -589,7 +598,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ecs_sub = ecs.add_subparsers(dest="ecs_command", required=True)
 
-    ecs_sub.add_parser("list", help="list carved-out domains").set_defaults(func=cmd_ecs_list)
+    ecs_sub.add_parser("list", help="list ECS exceptions").set_defaults(func=cmd_ecs_list)
 
     add = ecs_sub.add_parser("add", help="route a domain through the ECS-enabled service")
     add.add_argument("domain")
