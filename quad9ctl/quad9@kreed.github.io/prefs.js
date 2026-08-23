@@ -82,8 +82,9 @@ class SettingsPage {
         // --- Network bypasses ------------------------------------------
         this._networks = new Adw.PreferencesGroup({
             title: 'Network Bypasses',
-            description: 'Networks whose own resolver handles public DNS while connected, ' +
-                'such as a router that already forwards to Quad9',
+            description: 'Hand public DNS to the network’s own resolver while connected. ' +
+                'This gives up Quad9’s threat blocking, so only bypass networks whose ' +
+                'resolver you trust',
         });
         this._networkEntry = new Adw.EntryRow({
             title: 'Add by connection name or UUID',
@@ -99,10 +100,15 @@ class SettingsPage {
         // --- ECS exceptions ---------------------------------------------
         this._ecs = new Adw.PreferencesGroup({
             title: 'ECS Exceptions',
-            description: 'Domains resolved through Quad9’s ECS-enabled service, which ' +
-                'forwards your address truncated to a /24 so latency-routed records answer ' +
-                'from a nearby endpoint. Same malware blocking and DNSSEC; less subnet privacy',
+            description: 'Resolve these domains through Quad9’s ECS service instead of ' +
+                'the standard one. This gives up some privacy but may improve latency ' +
+                'for certain websites',
         });
+        this._ecs.set_header_suffix(new Gtk.LinkButton({
+            uri: 'https://quad9.net/support/faq/#edns',
+            label: 'More info',
+            valign: Gtk.Align.CENTER,
+        }));
         this._ecsEntry = new Adw.EntryRow({
             title: 'Add domain',
             show_apply_button: true,

@@ -568,8 +568,9 @@ def build_parser() -> argparse.ArgumentParser:
         "network",
         help="manage per-network bypass rules",
         description=(
-            "Bypass Quad9 on selected networks so their own resolver, such as "
-            "a caching router, handles public DNS while connected."
+            "Hand public DNS to a network's own resolver while connected. "
+            "This gives up Quad9's threat blocking, so only bypass networks "
+            "whose resolver you trust."
         ),
     )
     network_sub = network.add_subparsers(dest="network_command", required=True)

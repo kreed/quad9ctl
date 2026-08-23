@@ -45,12 +45,13 @@ sudo quad9ctl enable
 
 ## Per-network bypass
 
-Networks whose own resolver should handle public DNS — such as a home router
-that already forwards to Quad9 and caches for the whole LAN — can be given a
-standing bypass rule. The NetworkManager dispatcher re-applies the rules
-whenever a connection (including VPNs) comes up or goes down, so the bypass
-follows the network: connect and Quad9 is bypassed, disconnect and it
-returns.
+A standing bypass rule hands public DNS to the network's own resolver while
+connected. That gives up Quad9's threat blocking on that network, so reserve
+it for networks whose resolver you trust — a home router that resolves and
+caches for the whole LAN, for example. The NetworkManager dispatcher
+re-applies the rules whenever a connection (including VPNs) comes up or goes
+down, so the bypass follows the network: connect and Quad9 is bypassed,
+disconnect and it returns.
 
 ```bash
 quad9ctl network list
