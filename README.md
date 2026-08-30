@@ -15,6 +15,8 @@ The pieces, all installed by the `quad9ctl` RPM:
   per-network bypass rules, and per-domain ECS exceptions.
 - **A NetworkManager dispatcher** re-applies the rules as connections come
   and go.
+- **quad9ctl-portal-helper** runs the GNOME captive-portal sign-in browser
+  against the network's own resolver, and nothing else.
 - **gnome-shell-extension-quad9** (separate RPM) adds a quick-settings toggle
   fronting the same tool.
 
@@ -91,6 +93,48 @@ gnome-extensions enable quad9@kreed.github.io
 
 or enable it for all users through a gschema override for
 `org.gnome.shell enabled-extensions`.
+
+## Captive portal sign-in
+
+Portals are detected at the HTTP layer — NetworkManager's connectivity check
+resolves and fetches normally, the portal intercepts the request and answers
+with a redirect — so Quad9 does not stop GNOME from offering the sign-in
+window. What it does stop is the page loading, whenever the redirect points at
+a hostname only the network's own resolver knows (`login.gateway`,
+`wifi.hotel.local`): Quad9 answers NXDOMAIN and sign-in is impossible.
+
+`quad9ctl-portal-helper` handles that case with no configuration and nothing
+to turn on. It wraps GNOME's sign-in browser, running it in a mount namespace
+against the connected link's DHCP resolver, and is used whenever a D-Bus
+service file for `org.gnome.Shell.PortalHelper` names it as the `Exec=`:
+
+```
+[D-BUS Service]
+Name=org.gnome.Shell.PortalHelper
+Exec=/usr/libexec/quad9ctl-portal-helper
+```
+
+That file belongs to gnome-shell, so this package ships only the wrapper and
+leaves the substitution to whatever assembles the system — an image build can
+replace gnome-shell's copy after its package transaction. Without it the
+wrapper is inert and sign-in behaves exactly as it did before.
+
+The swap is confined to that one process tree. Nothing the sign-in browser
+resolves is cached by dnsproxy or systemd-resolved, no other program's
+lookups change while sign-in is in progress, and there is no state to undo
+afterwards — the namespace disappears with the browser. Two files are
+replaced inside it: `resolv.conf`, listing the link's servers, and
+`nsswitch.conf`, with `nss-resolve` dropped from the `hosts` line. The second
+is what makes the first take effect, since `nss-resolve` talks to
+systemd-resolved directly and never reads `resolv.conf` at all.
+
+The sign-in browser gives up Quad9's malware blocking for as long as it runs,
+against a network that has not been authenticated yet. It is a browser
+rendering a page chosen by that network either way; the bypass changes who
+resolves the names on it, not who serves them. Anything the wrapper cannot
+determine — no default route, no link DNS, `bwrap` missing — falls through to
+the unmodified helper, as does a system where Quad9 is disabled or already
+bypassed for the network.
 
 ## ECS exceptions
 

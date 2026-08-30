@@ -1,0 +1,68 @@
+#!/bin/bash
+# Run the GNOME captive-portal sign-in browser with the network's own resolver.
+#
+# A portal's redirect commonly points at a hostname only the network's resolver
+# knows ("login.gateway", "wifi.hotel.local"), which Quad9 answers with
+# NXDOMAIN, so the sign-in page never loads.  Handing the whole system to that
+# resolver to log in would give up threat blocking everywhere, so the swap is
+# confined to this one process tree with a mount namespace: nothing it resolves
+# is cached by dnsproxy or systemd-resolved, and every other process keeps
+# resolving through Quad9 while the sign-in is in progress.
+#
+# Installed as the Exec= of a per-user org.gnome.Shell.PortalHelper D-Bus
+# service file by 'quad9ctl portal enable'.
+
+set -u
+
+HELPER=/usr/libexec/gnome-shell-portal-helper
+
+# Any failure below falls through to the unmodified helper: a sign-in browser
+# resolving through Quad9 still works on the many portals that redirect to a
+# public hostname, and is always better than no sign-in browser at all.
+fallback() { exec "$HELPER" "$@"; }
+
+[[ -x $HELPER ]] || fallback "$@"
+command -v bwrap >/dev/null || fallback "$@"
+
+# Nothing to bypass when Quad9 is not the resolver for this network anyway.
+state=$(cat /run/quad9ctl/state 2>/dev/null) || state=""
+case "$state" in
+    disabled|bypassed) fallback "$@" ;;
+esac
+
+# The portal gates the network carrying the default route, so that link's
+# DHCP-provided servers are the ones that can answer for it.  systemd-resolved
+# keeps them per-link even while the global scope routes everything to Quad9.
+iface=$(ip -4 route show default 2>/dev/null | awk '{print $5; exit}')
+[[ -n $iface ]] || fallback "$@"
+
+mapfile -t servers < <(resolvectl dns "$iface" 2>/dev/null |
+    sed 's/^Link [0-9]* ([^)]*)://' | tr ' ' '\n' | grep -E '^[0-9a-fA-F:.]+$')
+[[ ${#servers[@]} -gt 0 ]] || fallback "$@"
+
+runtime="${XDG_RUNTIME_DIR:-/tmp}/quad9ctl-portal"
+mkdir -p "$runtime" || fallback "$@"
+
+: > "$runtime/resolv.conf" || fallback "$@"
+for server in "${servers[@]}"; do
+    printf 'nameserver %s\n' "$server" >> "$runtime/resolv.conf"
+done
+printf 'options timeout:2 attempts:2\n' >> "$runtime/resolv.conf"
+
+# resolv.conf alone changes nothing: nss-resolve talks to systemd-resolved over
+# varlink and never reads it, so the query would still reach Quad9.  Dropping
+# that module from the hosts line is what forces glibc down to nss-dns, which
+# does read resolv.conf.  Everything else in the file is left as configured.
+nsswitch=$(readlink -f /etc/nsswitch.conf) || fallback "$@"
+sed -E '/^hosts:/s/[[:space:]]*resolve[[:space:]]*(\[[^]]*\])?//' \
+    "$nsswitch" > "$runtime/nsswitch.conf" || fallback "$@"
+grep -qE '^hosts:.*[[:space:]]dns([[:space:]]|$)' "$runtime/nsswitch.conf" || fallback "$@"
+
+# --dev-bind / / keeps the session bus, Wayland socket and the rest of the
+# filesystem exactly as they are; only the two resolver files differ, and only
+# for this process and its children.  The bind target is the readlink-resolved
+# path because /etc/nsswitch.conf is a symlink on Fedora (into /etc/authselect).
+exec bwrap --dev-bind / / \
+    --ro-bind "$runtime/resolv.conf" /etc/resolv.conf \
+    --ro-bind "$runtime/nsswitch.conf" "$nsswitch" \
+    -- "$HELPER" "$@"

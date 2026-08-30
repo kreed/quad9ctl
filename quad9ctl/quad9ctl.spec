@@ -15,13 +15,16 @@ Requires:       python3
 Requires:       NetworkManager
 Requires:       systemd-resolved
 Requires:       polkit
+# The captive-portal sign-in bypass runs the browser in a mount namespace.
+Requires:       bubblewrap
 
 %description
 quad9ctl routes public DNS through a local dnsproxy instance speaking strict
 DNS over QUIC to Quad9, while systemd-resolved keeps network-specific domains
 on their per-link resolvers. It manages a persistent off switch, standing
 per-network bypass rules applied by a NetworkManager dispatcher, and
-per-domain EDNS Client Subnet exceptions.
+per-domain EDNS Client Subnet exceptions, and can confine the GNOME
+captive-portal sign-in browser to the network's own resolver.
 
 %package -n gnome-shell-extension-quad9
 Summary:        GNOME quick-settings toggle for Quad9 DNS routing
@@ -39,6 +42,8 @@ switch, network bypass rules, ECS exceptions and routing status.
 
 %install
 install -D --mode=0755 quad9ctl %{buildroot}%{_bindir}/quad9ctl
+install -D --mode=0755 quad9ctl-portal-helper \
+    %{buildroot}%{_libexecdir}/quad9ctl-portal-helper
 install -D --mode=0755 60-quad9 \
     %{buildroot}%{_prefix}/lib/NetworkManager/dispatcher.d/60-quad9
 install -D --mode=0644 quad9-dnsproxy.service \
@@ -79,6 +84,7 @@ python3 quad9ctl --help >/dev/null
 %files
 %license LICENSE-APACHE LICENSE-MIT
 %{_bindir}/quad9ctl
+%{_libexecdir}/quad9ctl-portal-helper
 %{_prefix}/lib/NetworkManager/dispatcher.d/60-quad9
 %{_unitdir}/quad9-dnsproxy.service
 %dir %{_unitdir}/systemd-resolved.service.d
