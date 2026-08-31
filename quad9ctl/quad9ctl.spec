@@ -1,6 +1,13 @@
 Name:           quad9ctl
 Version:        {{{ git_version name=quad9ctl lead=1 }}}
-Release:        1%{?dist}
+# Both macros read the annotated tag 'quad9ctl-<version>-<release>', taking the
+# second and third fields respectively.  All three fields are required: a tag
+# missing the release, or a lightweight one, is not matched at all and the build
+# silently falls back to a snapshot version off the previous tag.  On such a
+# snapshot both macros append the same '.git.<count>.<sha>' suffix; it is
+# stripped from the release because Version already carries it, and repeating it
+# there only makes the NVR unreadable.
+Release:        {{{ git_release name=quad9ctl | sed -E 's/\.(git|dirty)\..*$//' }}}%{?dist}
 Summary:        Quad9 DNS-over-QUIC routing control for systemd-resolved
 
 License:        Apache-2.0 OR MIT
