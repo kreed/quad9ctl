@@ -1,7 +1,7 @@
 %global goipath github.com/AdguardTeam/dnsproxy
 
 Name:           dnsproxy
-Version:        0.84.1
+Version:        0.84.2
 Release:        1%{?dist}
 Summary:        DNS proxy with support for encrypted DNS protocols
 
@@ -63,6 +63,9 @@ test_packages="$(go list ./... | grep -Ev '^%{goipath}/(proxy|upstream)$')"
 %{_bindir}/%{name}
 
 %changelog
+* Mon Sep 21 2026 Christopher Eby <kreed@kreed.org> - 0.84.2-1
+- Update to dnsproxy 0.84.2
+
 * Mon Aug 24 2026 Christopher Eby <kreed@kreed.org> - 0.84.1-1
 - Update to dnsproxy 0.84.1
 
