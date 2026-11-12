@@ -59,7 +59,7 @@ test_packages="$(go list ./... | grep -Ev '^%{goipath}/(proxy|upstream)$')"
 %files
 %license LICENSE
 %license %{_licensedir}/%{name}/modules.txt
-%doc README.md config.yaml.dist
+%doc README.md config.dist.yaml
 %{_bindir}/%{name}
 
 %changelog
